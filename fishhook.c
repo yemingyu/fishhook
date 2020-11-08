@@ -60,7 +60,7 @@ struct rebindings_entry {
   struct rebindings_entry *next;
 };
 
-static struct rebindings_entry *_rebindings_head;
+static struct rebindings_entry *_rebindings_head;   // 开发者输入的 hook 相关参数转化成的结构体数据，是一个递归结构可以用来遍历多个重绑定符号
 
 static int prepend_rebindings(struct rebindings_entry **rebindings_head,
                               struct rebinding rebindings[],
@@ -108,23 +108,23 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            nlist_t *symtab,
                                            char *strtab,
                                            uint32_t *indirect_symtab) {
-  const bool isDataConst = strcmp(section->segname, SEG_DATA_CONST) == 0;
-  uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
-  void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
+  const bool isDataConst = strcmp(section->segname, SEG_DATA_CONST) == 0;   // non-lazy 对应 __DATA_CONST
+  uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1; // lazy 或 nonlazy 的指针对应到 indirect Symbols 中的起始位置，便于后续遍历
+  void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);    // slide 是 ASLR，获取 lazy 或 nonlazy 表中位置，后续替换的就是 lazy、nonlazy 表中符号对应的地址
   vm_prot_t oldProtection = VM_PROT_READ;
-  if (isDataConst) {
+  if (isDataConst) {    // 老的 __DATA_CONST 需要的内存保护相关
     oldProtection = get_protection(rebindings);
     mprotect(indirect_symbol_bindings, section->size, PROT_READ | PROT_WRITE);
   }
-  for (uint i = 0; i < section->size / sizeof(void *); i++) {
+  for (uint i = 0; i < section->size / sizeof(void *); i++) {   // 目标符号与 lazy 或 nonlazy 表中逐个进行对比
     uint32_t symtab_index = indirect_symbol_indices[i];
     if (symtab_index == INDIRECT_SYMBOL_ABS || symtab_index == INDIRECT_SYMBOL_LOCAL ||
-        symtab_index == (INDIRECT_SYMBOL_LOCAL   | INDIRECT_SYMBOL_ABS)) {
+        symtab_index == (INDIRECT_SYMBOL_LOCAL   | INDIRECT_SYMBOL_ABS)) {  // 过滤无用部分
       continue;
     }
-    uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;
-    char *symbol_name = strtab + strtab_offset;
-    bool symbol_name_longer_than_1 = symbol_name[0] && symbol_name[1];
+    uint32_t strtab_offset = symtab[symtab_index].n_un.n_strx;  // 根据 symbol table 找到 string table 对应位置
+    char *symbol_name = strtab + strtab_offset; // string table 中获取符号名，为了后续进行目标函数名匹配
+    bool symbol_name_longer_than_1 = symbol_name[0] && symbol_name[1];  // 长度超过 1 才有效
     struct rebindings_entry *cur = rebindings;
     while (cur) {
       for (uint j = 0; j < cur->rebindings_nel; j++) {
@@ -132,9 +132,9 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
             strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
           if (cur->rebindings[j].replaced != NULL &&
               indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
-            *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
+            *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];   // replaced 值为 null，所以要用存放 replaced 变量的地址，然后让这个地址的内容为 hook 前的原函数地址，nl 表中符号对应的值 MachOView 上显示 00000，但实际读取内存是有值的，应该是 image 加载时 dyld 进行的处理
           }
-          indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
+          indirect_symbol_bindings[i] = cur->rebindings[j].replacement; // 调整内存中 lazy、nonlazy 表中符号对应的地址值，如果是调用 lazy 绑定函数，hook 前调用时会走到原有 lazy symbol pointer 里面的汇编代码，进而走到 stub 然后获取 bind 地址，hook 后就直接调用到 hook 替换的地址，需要调用原有函数时，就走前面说的流程；按照以前的分析 lazy binding 后会调整 lazy 表中符号对应的地址，这里替换后再走到 lazy binding 看起来不会覆盖内存中已经 hook 了的 lazy symbol pointer 里的汇编值；实践中多以 hook lazy 居多，nl 如 _mach_task_self_ 实测会成功
           goto symbol_loop;
         }
       }
@@ -161,7 +161,7 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
                                      const struct mach_header *header,
                                      intptr_t slide) {
   Dl_info info;
-  if (dladdr(header, &info) == 0) {
+  if (dladdr(header, &info) == 0) { // dladdr 会返回 mach_header 和 image 的名字
     return;
   }
 
@@ -175,12 +175,12 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
     cur_seg_cmd = (segment_command_t *)cur;
     if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
       if (strcmp(cur_seg_cmd->segname, SEG_LINKEDIT) == 0) {
-        linkedit_segment = cur_seg_cmd;
+        linkedit_segment = cur_seg_cmd; // 遍历 Segment 类型 Load Command 找到 linkedit segment 对应的 LC
       }
     } else if (cur_seg_cmd->cmd == LC_SYMTAB) {
-      symtab_cmd = (struct symtab_command*)cur_seg_cmd;
+      symtab_cmd = (struct symtab_command*)cur_seg_cmd; // 遍历 Load Command 找到 LC_SYMTAB
     } else if (cur_seg_cmd->cmd == LC_DYSYMTAB) {
-      dysymtab_cmd = (struct dysymtab_command*)cur_seg_cmd;
+      dysymtab_cmd = (struct dysymtab_command*)cur_seg_cmd; // 遍历 Load Command 找到 LC_DYSYMTAB
     }
   }
 
@@ -190,28 +190,28 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
   }
 
   // Find base symbol/string table addresses
-  uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;
-  nlist_t *symtab = (nlist_t *)(linkedit_base + symtab_cmd->symoff);
-  char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
+  uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;    // 根据 ASLR 偏移和 linkedit segment 虚拟地址等，获取二进制在内存中的基址
+  nlist_t *symtab = (nlist_t *)(linkedit_base + symtab_cmd->symoff);    // 获取内存中符号表的起始地址
+  char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);  // 获取内存中字符串表的起始地址
 
   // Get indirect symbol table (array of uint32_t indices into symbol table)
-  uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
+  uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);   // 获取内存中 Indirect Symbols 其实地址
 
   cur = (uintptr_t)header + sizeof(mach_header_t);
   for (uint i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
     cur_seg_cmd = (segment_command_t *)cur;
     if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
       if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
-          strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) != 0) {
+          strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) != 0) {  // lazy 表位于 __DATA 中，non-lazy 位于 __DATA_CONST 中
         continue;
       }
       for (uint j = 0; j < cur_seg_cmd->nsects; j++) {
         section_t *sect =
           (section_t *)(cur + sizeof(segment_command_t)) + j;
-        if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {
+        if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {   // 尝试匹配 lazy 表
           perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab);
         }
-        if ((sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
+        if ((sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {   // 尝试匹配 non-lazy 表
           perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab);
         }
       }
@@ -220,7 +220,7 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
 }
 
 static void _rebind_symbols_for_image(const struct mach_header *header,
-                                      intptr_t slide) {
+                                      intptr_t slide) { // header 为 image 对应 mach_header，slide 为 ASLR 偏移
     rebind_symbols_for_image(_rebindings_head, header, slide);
 }
 
@@ -239,18 +239,18 @@ int rebind_symbols_image(void *header,
 }
 
 int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
-  int retval = prepend_rebindings(&_rebindings_head, rebindings, rebindings_nel);
+  int retval = prepend_rebindings(&_rebindings_head, rebindings, rebindings_nel);   // 将开发者输入的 hook 相关参数转成递归结构体结构
   if (retval < 0) {
     return retval;
   }
   // If this was the first call, register callback for image additions (which is also invoked for
   // existing images, otherwise, just run on existing images
   if (!_rebindings_head->next) {
-    _dyld_register_func_for_add_image(_rebind_symbols_for_image);
+    _dyld_register_func_for_add_image(_rebind_symbols_for_image);   // 首次调用 rebind_symbols 走这个逻辑，当前存在的所有 image 都会触发此回调，后续每个新的 image 被加载绑定时也会触发回调，每个 image 都需要走一遍重绑定
   } else {
     uint32_t c = _dyld_image_count();
     for (uint32_t i = 0; i < c; i++) {
-      _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+      _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));    // 再次调用 rebind_symbols 走这个逻辑，对当前存在的所有 image 进行重新绑定符号处理，后续每个新的 image 被加载绑定时就不会触发回调了，所以尽量在首次把需要配置的 hook 配置完成
     }
   }
   return retval;
